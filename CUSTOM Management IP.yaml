@@ -1,0 +1,587 @@
+- service: arista.studio.v1.StudioConfigService
+  method: Set
+  body:
+    value:
+      key:
+        studio_id: edc1d0de-df53-498d-b7ca-b464efcbcef8
+        workspace_id: 91ae2c5f-22c1-4739-9c4a-7753fd966d41
+      created_at: '2026-09-09T14:56:59.733Z'
+      created_by: tmaurer
+      last_modified_at: '2026-09-09T17:19:29.756Z'
+      last_modified_by: tmaurer
+      display_name: CUSTOM Management IP
+      description: Custom Studio that assigns Management IPs to devices.
+      template:
+        type: TEMPLATE_TYPE_MAKO
+        body: |
+          <%
+          import ipaddress
+
+          def _s(v):
+              return str(v).strip() if v is not None else ""
+
+          ## EOS reserves these names; `vrf instance default` / `vrf instance main` are
+          ## invalid. The form no longer offers "default", so this is only a safety net
+          ## for rows written outside the UI or left over from the old schema.
+          _RESERVED_VRFS = ("default", "main")
+
+          ## ---------------------------------------------------------------- ##
+          ## 0. deviceId -> hostname, for human-readable messages only ##
+          ## ---------------------------------------------------------------- ##
+          _hostCache = {}
+          def hostName(devId):
+              if devId not in _hostCache:
+                  name = ""
+                  try:
+                      devs = ctx.topology.getDevices(deviceIds=[devId])
+                      if devs:
+                          name = _s(devs[0].hostName)
+                  except Exception:
+                      name = ""
+                  ## fall back to the ID if the device has no hostname in I&T
+                  _hostCache[devId] = name or devId
+              return _hostCache[devId]
+
+          def usableRange(gw, plen, label):
+              """Subnet and first/last usable host implied by the gateway + prefix length."""
+              plen = int(plen)
+              if plen > 31:
+                  raise ValueError(
+                      "%s: prefix length /%d cannot contain a gateway; use /31 or shorter" % (label, plen))
+              net = ipaddress.ip_network(u"%s/%d" % (gw, plen), strict=False)
+              if plen == 31:
+                  first, last = net[0], net[1] # RFC 3021 point-to-point
+              else:
+                  first, last = net[1], net[-2] # exclude network + broadcast
+              gwAddr = ipaddress.ip_address(u"%s" % gw)
+              if not (first <= gwAddr <= last):
+                  raise ValueError(
+                      "%s: gateway %s is not a usable host address in %s (valid %s - %s)"
+                      % (label, gw, net, first, last))
+              return net, first, last, gwAddr
+
+          def checkInRange(ip, net, first, last, gwAddr, who, label):
+              addr = ipaddress.ip_address(u"%s" % ip)
+              if addr not in net:
+                  raise ValueError("%s: %s is outside the %s subnet %s (valid %s - %s)"
+                                   % (who, ip, label, net, first, last))
+              if not (first <= addr <= last):
+                  raise ValueError("%s: %s is the network or broadcast address of %s; "
+                                   "valid host range is %s - %s" % (who, ip, net, first, last))
+              if addr == gwAddr:
+                  raise ValueError("%s: %s is the %s default gateway and cannot also be a device address"
+                                   % (who, ip, label))
+
+          ## ---------------------------------------------------------------- ##
+          ## 1. Global per-type management blocks. ##
+          ## The VRF field is optional: empty means the default VRF. ##
+          ## ---------------------------------------------------------------- ##
+          blocks = {}
+          if inbandManagementNetworkSettings:
+              _g = inbandManagementNetworkSettings
+              blocks["Inband"] = {
+                  "intf": _s(_g.get("inbandInterfaceName")),
+                  "vrf": _s(_g.get("inbandVrf")),
+                  "plen": _g.get("inbandPrefixLength"),
+                  "gw": _s(_g.get("inbandGateway")),
+              }
+          if oobManagementNetworkSettings:
+              _g = oobManagementNetworkSettings
+              blocks["OOB"] = {
+                  "intf": _s(_g.get("oobInterfaceName")),
+                  "vrf": _s(_g.get("oobVrf")),
+                  "plen": _g.get("oobPrefixLength"),
+                  "gw": _s(_g.get("oobGateway")),
+              }
+
+          _ranges = {}
+          def _rangeFor(t, blocks=blocks, cache=_ranges):
+              if t not in cache:
+                  b = blocks.get(t)
+                  if not b:
+                      raise ValueError("No global settings group filled in for Type '%s'" % t)
+                  if not b["intf"]:
+                      raise ValueError("No interface name configured for Type '%s'" % t)
+                  if b["plen"] in (None, ""):
+                      raise ValueError("No prefix length configured for Type '%s'" % t)
+                  if not b["gw"]:
+                      raise ValueError("No default gateway configured for Type '%s'" % t)
+                  ## note: VRF is deliberately NOT validated here -- it is optional.
+                  cache[t] = usableRange(b["gw"], b["plen"], "Type '%s'" % t)
+              return cache[t]
+
+          ## ---------------------------------------------------------------- ##
+          ## 2. Walk the resolver. A device with no row is simply not managed. ##
+          ## Problems are recorded PER DEVICE: only the offending device(s) ##
+          ## fail the build, everyone else builds normally. ##
+          ## ---------------------------------------------------------------- ##
+          myId = ctx.getDevice().id
+          problems = {} # deviceId -> [messages]
+          owners = {} # ip -> [deviceId]
+          mine = None # (ip, type) for this device
+
+          def addProblem(devId, msg, problems=problems):
+              problems.setdefault(devId, [])
+              if msg not in problems[devId]:
+                  problems[devId].append(msg)
+
+          for devId, inputs in device.resolveAll(strict=True):
+              grp = inputs.get("ipSettings") if inputs else None
+              if not grp:
+                  continue # no row -> device not managed
+              ip = _s(grp.get("ipAddress"))
+              typ = _s(grp.get("type"))
+              if not ip and not typ:
+                  continue # blank row -> ignored
+              who = hostName(devId)
+              if not ip:
+                  addProblem(devId, "%s: Type '%s' set but IPv4 Address is empty" % (who, typ))
+                  continue
+              if not typ:
+                  addProblem(devId, "%s: IPv4 Address %s set but Type is empty "
+                                    "(expected Inband or OOB)" % (who, ip))
+                  continue
+              if typ not in ("Inband", "OOB"):
+                  addProblem(devId, "%s: IPv4 %s has Type '%s' (expected Inband or OOB)" % (who, ip, typ))
+                  continue
+
+              owners.setdefault(ip, [])
+              if devId not in owners[ip]:
+                  owners[ip].append(devId)
+              if devId == myId:
+                  mine = (ip, typ)
+
+              ## Range / gateway / global-settings errors are charged only to this device,
+              ## i.e. only to devices that actually use this Type.
+              try:
+                  net, first, last, gwAddr = _rangeFor(typ)
+                  checkInRange(ip, net, first, last, gwAddr, who, typ)
+              except ValueError as e:
+                  addProblem(devId, str(e))
+
+          ## A duplicate is an error on every device that shares the address, and the
+          ## message names all of them.
+          for ip, devs in sorted(owners.items()):
+              if len(devs) > 1:
+                  names = sorted(hostName(d) for d in devs)
+                  for d in devs:
+                      addProblem(d, "duplicate IPv4 address %s used by: %s" % (ip, ", ".join(names)))
+
+          ## Fail ONLY if this device is one of the offenders.
+          myProblems = problems.get(myId)
+          if myProblems:
+              msg = "Management IP validation failed -- " + "; ".join(myProblems)
+              ctx.error(msg)
+              assert False, msg
+
+          ## Other devices' problems: log them here so they are visible on
+          ## Review Workspace -> Build Details, but do not fail this device.
+          for devId, msgs in problems.items():
+              if devId!= myId:
+                  ctx.info("Management IP validation failed on %s -- %s"
+                           % (hostName(devId), "; ".join(msgs)))
+
+          ## ---------------------------------------------------------------- ##
+          ## 3. This device (may legitimately have no row -> empty configlet) ##
+          ## ---------------------------------------------------------------- ##
+          myIp, myType = mine if mine else ("", "")
+
+          intf = vrf = gw = ""
+          plen = None
+          if myIp and myType in blocks:
+              b = blocks[myType]
+              intf, vrf, plen, gw = b["intf"], b["vrf"], int(b["plen"]), b["gw"]
+
+          ## No VRF selected -> default VRF: no `vrf instance`, no interface `vrf`,
+          ## no `vrf` keyword in the static route.
+          useVrf = bool(vrf)
+          if useVrf and vrf.lower() in _RESERVED_VRFS:
+              ## Reserved in EOS and no longer selectable in the form; fall back to
+              ## default-VRF output instead of generating config the switch rejects.
+              ctx.info("Type '%s': VRF name '%s' is reserved in EOS; treating as the default VRF"
+                       % (myType, vrf))
+              useVrf = False
+
+          ## Set to True only for a dataplane (routed) VRF. Leave False for a pure
+          ## management VRF, which has routing disabled by design. Ignored when no
+          ## VRF is selected.
+          enableVrfRouting = False
+          %>\
+          % if myIp and intf:
+          % if useVrf:
+          vrf instance ${vrf}
+          !
+          % if enableVrfRouting:
+          ip routing vrf ${vrf}
+          !
+          % endif
+          % endif
+          interface ${intf}
+          % if useVrf:
+             vrf ${vrf}
+          % endif
+             ip address ${myIp}/${plen}
+          !
+          % if useVrf:
+          ip route vrf ${vrf} 0.0.0.0/0 ${gw}
+          % else:
+          ip route 0.0.0.0/0 ${gw}
+          % endif
+          % endif
+      input_schema:
+        fields:
+          values:
+            4e1cadd2-0f4c-498e-be3e-658cfa4093a7:
+              id: 4e1cadd2-0f4c-498e-be3e-658cfa4093a7
+              type: INPUT_FIELD_TYPE_STRING
+              name: ipAddress
+              label: IPv4 Address
+              description: ''
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options: null
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: ipv4
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            e03e68c5-71ae-43b7-ac75-af9c1c38240f:
+              id: e03e68c5-71ae-43b7-ac75-af9c1c38240f
+              type: INPUT_FIELD_TYPE_INTEGER
+              name: oobPrefixLength
+              label: OOB Prefix Length
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props:
+                default_value: null
+                static_options: null
+                range: 8..31
+                dynamic_options: null
+                extra_values_allowed: false
+              float_props: null
+              string_props: null
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            5897ea3d-cdba-4185-a7c5-fdeda85f98a2:
+              id: 5897ea3d-cdba-4185-a7c5-fdeda85f98a2
+              type: INPUT_FIELD_TYPE_STRING
+              name: inbandInterfaceName
+              label: Inband Interface Name
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options:
+                  values:
+                    - Vlan100
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: null
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            root:
+              id: root
+              type: INPUT_FIELD_TYPE_GROUP
+              name: ''
+              label: ''
+              description: ''
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props: null
+              group_props:
+                members:
+                  values:
+                    - 7dc2eaad-2f27-490b-b51c-45a39caf5a57
+                    - ddc07589-8f17-4610-95c0-ba012f4bc14a
+                    - 11a8ac0d-5567-4001-9861-2a2ffea1481f
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: null
+              tag_matcher_props: null
+            f24269ef-b807-49f1-ab63-25239609ed1d:
+              id: f24269ef-b807-49f1-ab63-25239609ed1d
+              type: INPUT_FIELD_TYPE_STRING
+              name: oobVrf
+              label: OOB VRF
+              description: ''
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options:
+                  values:
+                    - MGMT
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: null
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            075d90f5-c4ae-4971-81c1-a9ad2ee3a4b7:
+              id: 075d90f5-c4ae-4971-81c1-a9ad2ee3a4b7
+              type: INPUT_FIELD_TYPE_STRING
+              name: oobGateway
+              label: OOB Gateway
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options: null
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: ipv4
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            11a8ac0d-5567-4001-9861-2a2ffea1481f:
+              id: 11a8ac0d-5567-4001-9861-2a2ffea1481f
+              type: INPUT_FIELD_TYPE_GROUP
+              name: oobManagementNetworkSettings
+              label: OOB Management Network Settings
+              description: Basic Out-of-Band management settings.
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props: null
+              group_props:
+                members:
+                  values:
+                    - 7ae91ad6-8a17-4e94-9c8f-d5971c62af49
+                    - f24269ef-b807-49f1-ab63-25239609ed1d
+                    - e03e68c5-71ae-43b7-ac75-af9c1c38240f
+                    - 075d90f5-c4ae-4971-81c1-a9ad2ee3a4b7
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            66fe0929-9e10-424e-b636-bd7f5fdab693:
+              id: 66fe0929-9e10-424e-b636-bd7f5fdab693
+              type: INPUT_FIELD_TYPE_INTEGER
+              name: inbandPrefixLength
+              label: Inband Prefix Length
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props:
+                default_value: null
+                static_options: null
+                range: 8..31
+                dynamic_options: null
+                extra_values_allowed: false
+              float_props: null
+              string_props: null
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            7dc2eaad-2f27-490b-b51c-45a39caf5a57:
+              id: 7dc2eaad-2f27-490b-b51c-45a39caf5a57
+              type: INPUT_FIELD_TYPE_RESOLVER
+              name: device
+              label: Device
+              description: Select the device, assign a management IP address and choose between Inband and Out-of-Band management.
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props: null
+              group_props: null
+              collection_props: null
+              resolver_props:
+                base_field_id: 343d3969-a819-46b4-92b4-ebd68b25e3fe
+                display_mode: RESOLVER_FIELD_DISPLAY_MODE_SPARSE
+                input_mode: RESOLVER_FIELD_INPUT_MODE_SINGLE_DEVICE_TAG
+                input_tag_label: device
+                tag_filter_query: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            7ae91ad6-8a17-4e94-9c8f-d5971c62af49:
+              id: 7ae91ad6-8a17-4e94-9c8f-d5971c62af49
+              type: INPUT_FIELD_TYPE_STRING
+              name: oobInterfaceName
+              label: OOB Interface Name
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options:
+                  values:
+                    - Management1
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: null
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            c1ef08a6-f2f2-4a91-8386-160b7e2a6e9c:
+              id: c1ef08a6-f2f2-4a91-8386-160b7e2a6e9c
+              type: INPUT_FIELD_TYPE_STRING
+              name: inbandVrf
+              label: Inband VRF
+              description: ''
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options:
+                  values:
+                    - MGMT
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: null
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            3272e3d9-1bf6-4e42-aabc-a1be1e60c6e0:
+              id: 3272e3d9-1bf6-4e42-aabc-a1be1e60c6e0
+              type: INPUT_FIELD_TYPE_STRING
+              name: inbandGateway
+              label: Inband Gateway
+              description: ''
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options: null
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: ipv4
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            ddc07589-8f17-4610-95c0-ba012f4bc14a:
+              id: ddc07589-8f17-4610-95c0-ba012f4bc14a
+              type: INPUT_FIELD_TYPE_GROUP
+              name: inbandManagementNetworkSettings
+              label: Inband Management Network Settings
+              description: Basic Inband management settings.
+              required: true
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props: null
+              group_props:
+                members:
+                  values:
+                    - c1ef08a6-f2f2-4a91-8386-160b7e2a6e9c
+                    - 5897ea3d-cdba-4185-a7c5-fdeda85f98a2
+                    - 66fe0929-9e10-424e-b636-bd7f5fdab693
+                    - 3272e3d9-1bf6-4e42-aabc-a1be1e60c6e0
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            ba0114d8-ed9b-4d69-91c6-d14f09d1df41:
+              id: ba0114d8-ed9b-4d69-91c6-d14f09d1df41
+              type: INPUT_FIELD_TYPE_STRING
+              name: type
+              label: Type
+              description: Inband or Out-of-Band
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props:
+                default_value: null
+                static_options:
+                  values:
+                    - Inband
+                    - OOB
+                dynamic_options: null
+                length: null
+                pattern: null
+                format: null
+                is_secret: false
+                extra_values_allowed: false
+              group_props: null
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+            343d3969-a819-46b4-92b4-ebd68b25e3fe:
+              id: 343d3969-a819-46b4-92b4-ebd68b25e3fe
+              type: INPUT_FIELD_TYPE_GROUP
+              name: ipSettings
+              label: IP Settings
+              description: ''
+              required: false
+              boolean_props: null
+              integer_props: null
+              float_props: null
+              string_props: null
+              group_props:
+                members:
+                  values:
+                    - 4e1cadd2-0f4c-498e-be3e-658cfa4093a7
+                    - ba0114d8-ed9b-4d69-91c6-d14f09d1df41
+              collection_props: null
+              resolver_props: null
+              auto_fill_action_id: ''
+              tag_matcher_props: null
+        layout:
+          value: '{"7dc2eaad-2f27-490b-b51c-45a39caf5a57":{"key":"7dc2eaad-2f27-490b-b51c-45a39caf5a57","isPageLayout":false,"showDefaultRow":false,"dependencyType":"AND","type":"INPUT"},"343d3969-a819-46b4-92b4-ebd68b25e3fe":{"key":"343d3969-a819-46b4-92b4-ebd68b25e3fe","dependencyType":"AND","type":"INPUT"},"ddc07589-8f17-4610-95c0-ba012f4bc14a":{"key":"ddc07589-8f17-4610-95c0-ba012f4bc14a","type":"INPUT","order":["5897ea3d-cdba-4185-a7c5-fdeda85f98a2","c1ef08a6-f2f2-4a91-8386-160b7e2a6e9c","66fe0929-9e10-424e-b636-bd7f5fdab693","3272e3d9-1bf6-4e42-aabc-a1be1e60c6e0"]},"8a76f587-88d9-4d96-a03b-743c6786c933":{"key":"8a76f587-88d9-4d96-a03b-743c6786c933","type":"INPUT","isPageLayout":false},"ef5256e2-b0c2-4b13-abd6-4686b50f6b52":{"key":"ef5256e2-b0c2-4b13-abd6-4686b50f6b52","type":"INPUT"}}'
+      from_package: ''
